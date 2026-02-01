@@ -1,0 +1,227 @@
+﻿import { mkdir, readFile, writeFile } from 'fs/promises'
+import { join, resolve } from 'path'
+import { Readable } from 'stream'
+
+// We are just using the filesystem to store assets
+const DIR = resolve('./.assets')
+
+export async function storeAsset(id: string, stream: Readable) {
+	await mkdir(DIR, { recursive: true })
+	await writeFile(join(DIR, id), stream)
+}
+
+export async function loadAsset(id: string) {
+	return await readFile(join(DIR, id))
+}
+export const defaultModel = {"clock":1,"tombstones":{},"schema":{"schemaVersion":2,"sequences":{"com.tldraw.store":4,"com.tldraw.asset":1,"com.tldraw.camera":1,"com.tldraw.document":2,"com.tldraw.instance":25,"com.tldraw.instance_page_state":5,"com.tldraw.page":1,"com.tldraw.instance_presence":6,"com.tldraw.pointer":1,"com.tldraw.shape":4,"com.tldraw.asset.bookmark":2,"com.tldraw.asset.image":5,"com.tldraw.asset.video":5,"com.tldraw.shape.arrow":5,"com.tldraw.shape.bookmark":2,"com.tldraw.shape.draw":2,"com.tldraw.shape.embed":4,"com.tldraw.shape.frame":1,"com.tldraw.shape.geo":10,"com.tldraw.shape.group":0,"com.tldraw.shape.highlight":1,"com.tldraw.shape.image":5,"com.tldraw.shape.line":5,"com.tldraw.shape.note":9,"com.tldraw.shape.text":3,"com.tldraw.shape.video":3,"com.tldraw.shape.family-member":0,"com.tldraw.binding.arrow":0}},"documents":[{"state":{"gridSize":10,"name":"default-name","meta":{},"id":"document:document","typeName":"document"},"lastChangedClock":1},{"state":{"meta":{},"id":"page:page","name":"Page 1","index":"a1","typeName":"page"},"lastChangedClock":0}]}import type { RoomSnapshot } from "@tldraw/sync-core";
+import { TLSocketRoom } from "@tldraw/sync-core";
+import { mkdir, readFile, writeFile, rm } from "fs/promises";
+import { join } from "path";
+import {
+  createTLSchema,
+  defaultBindingSchemas,
+  defaultShapeSchemas,
+} from "tldraw";
+import type {TLRecord} from 'tldraw'
+import { defaultModel } from "./default-model";
+
+async function safeRm(path: string): Promise<void> {
+  try {
+    await rm(path);
+  } catch (e) {
+    if (e instanceof Error && (e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw e;
+    }
+  }
+}
+
+const DIR = "./.rooms";
+async function readSnapshotIfExists(roomId: string) {
+  try {
+    const data = await readFile(join(DIR, roomId));
+    return JSON.parse(data.toString()) ?? undefined;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  } catch (e) {
+    return defaultModel;
+  }
+}
+async function saveSnapshot(roomId: string, snapshot: RoomSnapshot) {
+  await mkdir(DIR, { recursive: true });
+  await writeFile(join(DIR, roomId), JSON.stringify(snapshot));
+}
+
+interface RoomState {
+  room: TLSocketRoom<TLRecord, void>;
+  id: string;
+  needsPersist: boolean;
+}
+const rooms = new Map<string, RoomState>();
+
+let mutex = Promise.resolve<null | Error>(null);
+
+const schema = createTLSchema({
+  shapes: {
+    ...defaultShapeSchemas,
+    "family-member": {},
+  },
+  bindings: defaultBindingSchemas,
+});
+
+export async function makeOrLoadRoom(roomId: string) {
+  // eslint-disable-next-line no-console
+  console.log(roomId);
+  mutex = mutex
+    .then(async () => {
+      if (rooms.has(roomId)) {
+        const roomState = await rooms.get(roomId)!;
+        if (!roomState.room.isClosed()) {
+          return null;
+        }
+      }
+      // eslint-disable-next-line no-console
+      console.log("loading room", roomId);
+      const initialSnapshot = await readSnapshotIfExists(roomId);
+
+      const roomState: RoomState = {
+        needsPersist: false,
+        id: roomId,
+        room: new TLSocketRoom({
+          schema,
+          initialSnapshot,
+          onSessionRemoved(room, args) {
+            // eslint-disable-next-line no-console
+            console.log("client disconnected", args.sessionId, roomId);
+            if (args.numSessionsRemaining === 0) {
+              // eslint-disable-next-line no-console
+              console.log("closing room", roomId);
+              room.close();
+            }
+          },
+          onDataChange() {
+            roomState.needsPersist = true;
+          },
+        }),
+      };
+
+      rooms.set(roomId, roomState);
+      return null;
+    })
+    .catch((error) => {
+      return error;
+    });
+
+  const err = await mutex;
+  if (err) throw err;
+
+  const state = rooms.get(roomId);
+  if (!state || state.room.isClosed()) {
+    throw new Error(`Room ${roomId} was unexpectedly removed`);
+  }
+
+  return state.room;
+}
+
+setInterval(() => {
+ for (const roomState of rooms.values()) {
+  if (roomState.needsPersist) {
+    roomState.needsPersist = false;
+    // eslint-disable-next-line no-console
+    console.log("saving snapshot", roomState.id);
+    saveSnapshot(roomState.id, roomState.room.getCurrentSnapshot());
+  }
+  if (roomState.room.isClosed()) {
+    // eslint-disable-next-line no-console
+    console.log("deleting room", roomState.id);
+    rooms.delete(roomState.id);
+    safeRm(join(DIR, roomState.id));
+  }
+}
+}, 2000);
+import cors from "@fastify/cors";
+import websocketPlugin from "@fastify/websocket";
+import fastify from "fastify";
+import type { RawData } from "ws";
+import { loadAsset, storeAsset } from "./assets";
+import { makeOrLoadRoom } from "./rooms";
+import { unfurl } from "./unfurl";
+
+const PORT = 5858;
+
+const app = fastify();
+app.register(websocketPlugin);
+app.register(cors, {
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+});
+
+app.register(async (app) => {
+  app.get("/api/healthcheck", async () => {
+    return "OK";
+  });
+
+  app.get("/api/connect/:roomId", { websocket: true }, async (socket, req) => {
+    const roomId = (req.params as { roomId: string }).roomId;
+    const sessionId = (req.query as { sessionId?: string })?.sessionId || "";
+    const isReadonly =
+      (req.query as { readOnly?: string })?.readOnly === "true" || false;
+    const caughtMessages: RawData[] = [];
+
+    const collectMessagesListener = (message: RawData) => {
+      caughtMessages.push(message);
+    };
+
+    socket.on("message", collectMessagesListener);
+
+    const room = await makeOrLoadRoom(roomId);
+    room.handleSocketConnect({ sessionId, socket, isReadonly });
+
+    socket.off("message", collectMessagesListener);
+
+    for (const message of caughtMessages) {
+      socket.emit("message", message);
+    }
+  });
+
+  app.addContentTypeParser("*", (_, __, done) => done(null));
+  app.put("/api/uploads/:id", {}, async (req, res) => {
+    const id = (req.params as { id: string }).id;
+    await storeAsset(id, req.raw);
+    res.send({ ok: true });
+  });
+  app.get("/api/uploads/:id", async (req, res) => {
+    const id = (req.params as { id: string }).id;
+    const data = await loadAsset(id);
+    res.send(data);
+  });
+
+  app.get("/api/unfurl", async (req, res) => {
+    const url = (req.query as { url: string }).url;
+    res.send(await unfurl(url));
+  });
+});
+
+app.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
+  if (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    process.exit(1);
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(`Server started on port ${PORT}`);
+});
+import { unfurl as _unfurl } from "unfurl.js";
+
+export async function unfurl(url: string) {
+  const { title, description, open_graph, twitter_card, favicon } =
+    await _unfurl(url);
+
+  const image = open_graph?.images?.[0]?.url || twitter_card?.images?.[0]?.url;
+
+  return {
+    title,
+    description,
+    image,
+    favicon,
+  };
+}
